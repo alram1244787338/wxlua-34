@@ -217,10 +217,55 @@ function QuerySaveChanges()
     return result
 end
 
-function LoadScribbles(fileName)
-    pointsList = {}
+function LoadScribbles(filePath)
+    -- Check file existence first for a clear "not found" message
+    local fh = io.open(filePath, "r")
+    if not fh then
+        return false, "load", "Cannot open file:\n" .. filePath
+    end
+    fh:close()
+
+    -- Save current drawing state so we can restore it on any failure
+    local oldPointsList = pointsList
+    local oldLastDrawn  = lastDrawn
+
+    -- Clear pointsList before dofile so we can detect whether the file
+    -- actually defines it (otherwise the old global value would persist
+    -- and silently pass validation).
+    pointsList = nil
+
+    -- Attempt to compile and execute the file.
+    -- pcall returns (true, ...) on success or (false, errmsg) on any error
+    -- (syntax error, runtime error, etc.)
+    local ok, err = pcall(dofile, filePath)
+    if not ok then
+        pointsList = oldPointsList
+        lastDrawn  = oldLastDrawn
+        return false, "run", err
+    end
+
+    -- Validate that the file actually defined a usable pointsList
+    if type(pointsList) ~= "table" then
+        pointsList = oldPointsList
+        lastDrawn  = oldLastDrawn
+        return false, "format", "File does not define a pointsList table."
+    end
+
+    -- Validate structure: each segment must be a table with pen.colour
+    for i, segment in ipairs(pointsList) do
+        if type(segment) ~= "table"
+           or type(segment.pen) ~= "table"
+           or type(segment.pen.colour) ~= "table" then
+            pointsList = oldPointsList
+            lastDrawn  = oldLastDrawn
+            return false, "format",
+                   string.format("Segment %d has invalid structure.", i)
+        end
+    end
+
+    -- All checks passed — commit the new data
     lastDrawn = 0
-    return ((pcall(dofile, fileName)) ~= nil)
+    return true
 end
 
 -- modified from the lua sample save.lua
@@ -228,7 +273,7 @@ function savevar(fh, n, v)
     if v ~= nil then
         fh:write(n, "=")
         if type(v) == "string" then
-            fh:write(format("%q", v))
+            fh:write(string.format("%q", v))
         elseif type(v) == "table" then
             fh:write("{}\n")
             for r,f in pairs(v) do
@@ -269,10 +314,24 @@ function Open()
                                        wx.wxFD_OPEN + wx.wxFD_FILE_MUST_EXIST)
     local result = false
     if fileDialog:ShowModal() == wx.wxID_OK then
-        fileName = fileDialog:GetPath()
-        result = LoadScribbles(fileName)
-        if result then
+        local selectedFile = fileDialog:GetPath()
+        local ok, errType, errMsg = LoadScribbles(selectedFile)
+        if ok then
+            -- Only update fileName and title after a confirmed successful load
+            fileName = selectedFile
             frame:SetTitle("wxLua Scribble - " .. fileName)
+            result = true
+        else
+            -- Build a human-readable message depending on the failure category
+            local errorMessages = {
+                load   = "Could not open the file.\n\n" .. (errMsg or selectedFile),
+                run    = "An error occurred while loading the file:\n\n" .. (errMsg or "unknown error"),
+                format = "The file does not contain valid scribble data.\n\n" .. (errMsg or ""),
+            }
+            wx.wxMessageBox(errorMessages[errType] or "Unknown error loading file.",
+                            "wxLua Scribble - Open Error",
+                            wx.wxOK + wx.wxICON_ERROR,
+                            frame)
         end
     end
     fileDialog:Destroy()
