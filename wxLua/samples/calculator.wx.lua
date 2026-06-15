@@ -13,14 +13,27 @@
 package.cpath = package.cpath..";./?.dll;./?.so;../lib/?.so;../lib/vc_dll/?.dll;../lib/bcc_dll/?.dll;../lib/mingw_dll/?.dll;"
 require("wx")
 
+-- Load the pure-Lua calculator state machine that lives next to this script,
+-- regardless of the current working directory.
+do
+    local src = debug.getinfo(1, "S").source
+    if src:sub(1, 1) == "@" then
+        local dir = src:match("^@(.*[/\\])")
+        if dir then
+            package.path = package.path .. ";" .. dir .. "?.lua"
+        end
+    end
+end
+local Calc = require("calculator_core")
+
 -- ---------------------------------------------------------------------------
 -- Global variables
 dialog        = nil -- the wxDialog main toplevel window
 xmlResource   = nil -- the XML resource handle
 txtDisplay    = nil -- statictext window for the display
-clearDisplay  = false
-lastNumber    = 0     -- the last number pressed, 0 - 9
-lastOperationId = nil -- the window id of last operation button pressed
+calc          = Calc.new() -- the calculator state machine (display + operands)
+numberMap     = nil -- maps number button window ids to digits 0-9
+opMap         = nil -- maps operator button window ids to "+","-","*","/","="
 
 local xpmdata =
 {
@@ -85,99 +98,31 @@ end
 -- ---------------------------------------------------------------------------
 -- Handle the clear button event
 function OnClear(event)
-    txtDisplay:SetLabel("0")
-    lastNumber      = 0
-    lastOperationId = ID_PLUS
+    calc:reset()
+    txtDisplay:SetLabel(calc:getDisplay())
 end
 
 -- ---------------------------------------------------------------------------
--- Handle all number button events
+-- Handle all number button events (digits and the decimal point)
 function OnNumber(event)
-    local numberId      = event:GetId()
-    local displayString = txtDisplay:GetLabel()
+    local numberId = event:GetId()
 
-    if (displayString == "0") or (tonumber(displayString) == nil) or clearDisplay then
-        displayString = ""
+    if numberId == ID_DECIMAL then
+        calc:inputDecimal()
+    else
+        calc:inputDigit(numberMap[numberId])
     end
-    clearDisplay = false
 
-    -- Limit string length to 12 chars
-    if string.len(displayString) < 12 then
-        if numberId == ID_DECIMAL then
-            if not string.find(displayString, ".", 1, 1) then
-                -- If the first pressed char is "." then we want "0."
-                if string.len(displayString) == 0 then
-                    displayString = displayString.."0."
-                else
-                    displayString = displayString.."."
-                end
-            end
-        else
-            -- map button window ids to numeric values
-            local idTable = { [ID_0] = 0, [ID_1] = 1, [ID_2] = 2, [ID_3] = 3,
-                              [ID_4] = 4, [ID_5] = 5, [ID_6] = 6, [ID_7] = 7,
-                              [ID_8] = 8, [ID_9] = 9 }
-
-            local num = idTable[numberId]
-
-            -- If first character entered is 0 we reject it
-            if (num == 0) and (string.len(displayString) == 0) then
-                displayString = "0"
-            elseif displayString == "" then
-                displayString = tostring(num)
-            else
-                displayString = displayString..num
-            end
-        end
-
-        txtDisplay:SetLabel(displayString)
-    end
+    txtDisplay:SetLabel(calc:getDisplay())
 end
 
 -- ---------------------------------------------------------------------------
--- Calculate the operation
-function DoOperation(a, b, operationId)
-    local result = a
-    if operationId == ID_PLUS then
-        result =  b + a
-    elseif operationId == ID_MINUS then
-        result =  b - a
-    elseif operationId == ID_MULTIPLY then
-        result = b * a
-    elseif operationId == ID_DIVIDE then
-        if a == 0 then
-            result = "Divide by zero error"
-        else
-            result = b / a
-        end
-    end
-    return result
-end
-
--- ---------------------------------------------------------------------------
--- Handle all operation button events
+-- Handle all operation button events (+ - x / and =). The arithmetic and the
+-- state machine live in calculator_core; here we only translate the button
+-- window id to an operator and refresh the display.
 function OnOperator(event)
-    -- Get display content
-    local displayString = txtDisplay:GetLabel()
-    local currentNumber = tonumber(displayString)
-
-    -- if error message was shown, zero output and ignore operator
-    if ((currentNumber == nil) or (lastNumber == nil)) then
-        lastNumber = 0
-        return
-    end
-
-    -- Get the required lastOperationId
-    local operationId = event:GetId()
-
-    displayString = DoOperation(currentNumber, lastNumber, lastOperationId)
-    lastNumber    = tonumber(displayString)
-
-    if (lastOperationId ~= ID_EQUALS) or (operationId == ID_EQUALS) then
-        txtDisplay:SetLabel(tostring(displayString))
-    end
-    clearDisplay    = true
-    lastOperationId = operationId
+    calc:inputOperator(opMap[event:GetId()])
+    txtDisplay:SetLabel(calc:getDisplay())
 end
 
 -- ---------------------------------------------------------------------------
@@ -290,7 +235,14 @@ function main()
     ID_OFF      = xmlResource.GetXRCID("ID_OFF")
     ID_CLEAR    = xmlResource.GetXRCID("ID_CLEAR")
 
-    lastOperationId = ID_PLUS
+    -- map button window ids to the values the calculator core understands
+    numberMap = { [ID_0] = 0, [ID_1] = 1, [ID_2] = 2, [ID_3] = 3,
+                  [ID_4] = 4, [ID_5] = 5, [ID_6] = 6, [ID_7] = 7,
+                  [ID_8] = 8, [ID_9] = 9 }
+    opMap     = { [ID_PLUS]     = "+", [ID_MINUS]  = "-",
+                  [ID_MULTIPLY] = "*", [ID_DIVIDE] = "/",
+                  [ID_EQUALS]   = "=" }
+    calc:reset()
 
     dialog:Connect(ID_0,        wx.wxEVT_COMMAND_BUTTON_CLICKED, OnNumber)
     dialog:Connect(ID_1,        wx.wxEVT_COMMAND_BUTTON_CLICKED, OnNumber)
