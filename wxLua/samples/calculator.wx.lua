@@ -21,6 +21,8 @@ txtDisplay    = nil -- statictext window for the display
 clearDisplay  = false
 lastNumber    = 0     -- the last number pressed, 0 - 9
 lastOperationId = nil -- the window id of last operation button pressed
+pendingNewNumber = true -- true when waiting for the next operand (no new
+                        -- digits entered since the last operator/= was pressed)
 
 local xpmdata =
 {
@@ -83,11 +85,19 @@ function GetExePath()
 end
 
 -- ---------------------------------------------------------------------------
+-- Reset calculator to a clean initial state (used by OnClear and startup)
+function ResetCalculator()
+    txtDisplay:SetLabel("0")
+    lastNumber       = 0
+    lastOperationId  = ID_PLUS
+    clearDisplay     = false
+    pendingNewNumber = true
+end
+
+-- ---------------------------------------------------------------------------
 -- Handle the clear button event
 function OnClear(event)
-    txtDisplay:SetLabel("0")
-    lastNumber      = 0
-    lastOperationId = ID_PLUS
+    ResetCalculator()
 end
 
 -- ---------------------------------------------------------------------------
@@ -96,10 +106,15 @@ function OnNumber(event)
     local numberId      = event:GetId()
     local displayString = txtDisplay:GetLabel()
 
-    if (displayString == "0") or (tonumber(displayString) == nil) or clearDisplay then
+    -- Start a fresh entry when:
+    --   * the display shows an error string (tonumber == nil), or
+    --   * the display is "0" (no meaningful value yet), or
+    --   * we are waiting for a new operand after an operator/= press
+    if (tonumber(displayString) == nil) or (displayString == "0") or pendingNewNumber then
         displayString = ""
     end
-    clearDisplay = false
+    pendingNewNumber = false
+    clearDisplay     = false
 
     -- Limit string length to 12 chars
     if string.len(displayString) < 12 then
@@ -157,27 +172,49 @@ end
 -- ---------------------------------------------------------------------------
 -- Handle all operation button events
 function OnOperator(event)
-    -- Get display content
     local displayString = txtDisplay:GetLabel()
     local currentNumber = tonumber(displayString)
+    local operationId   = event:GetId()
 
-    -- if error message was shown, zero output and ignore operator
-    if ((currentNumber == nil) or (lastNumber == nil)) then
-        lastNumber = 0
+    -----------------------------------------------------------------------
+    -- Error recovery: the display shows a non-numeric message (e.g. after
+    -- a divide-by-zero).  Reset internal state and silently absorb the
+    -- operator so the user can start fresh.
+    -----------------------------------------------------------------------
+    if currentNumber == nil then
+        ResetCalculator()
         return
     end
 
-    -- Get the required lastOperationId
-    local operationId = event:GetId()
-
-    displayString = DoOperation(currentNumber, lastNumber, lastOperationId)
-    lastNumber    = tonumber(displayString)
-
-    if (lastOperationId ~= ID_EQUALS) or (operationId == ID_EQUALS) then
-        txtDisplay:SetLabel(tostring(displayString))
+    -----------------------------------------------------------------------
+    -- Consecutive operator presses (no new digits entered since the last
+    -- operator).  Just replace the pending operator without computing.
+    -- This also covers pressing an operator right after startup.
+    -----------------------------------------------------------------------
+    if pendingNewNumber then
+        -- If the previous operator was "=" we need to anchor the next
+        -- operation chain on the result currently on screen.
+        if lastOperationId == ID_EQUALS then
+            lastNumber      = currentNumber
+            lastOperationId = operationId
+        else
+            -- Simply swap in the new operator; lastNumber stays valid.
+            lastOperationId = operationId
+        end
+        return
     end
-    clearDisplay    = true
-    lastOperationId = operationId
+
+    -----------------------------------------------------------------------
+    -- Normal case: a new operand was entered – perform the pending
+    -- computation and update the accumulated result.
+    -----------------------------------------------------------------------
+    local result      = DoOperation(currentNumber, lastNumber, lastOperationId)
+    local resultStr   = tostring(result)
+    lastNumber        = tonumber(resultStr)   -- nil if result is an error msg
+    lastOperationId   = operationId
+    pendingNewNumber  = true
+
+    txtDisplay:SetLabel(resultStr)
 end
 
 -- ---------------------------------------------------------------------------
@@ -290,7 +327,8 @@ function main()
     ID_OFF      = xmlResource.GetXRCID("ID_OFF")
     ID_CLEAR    = xmlResource.GetXRCID("ID_CLEAR")
 
-    lastOperationId = ID_PLUS
+    lastOperationId  = ID_PLUS
+    pendingNewNumber = true
 
     dialog:Connect(ID_0,        wx.wxEVT_COMMAND_BUTTON_CLICKED, OnNumber)
     dialog:Connect(ID_1,        wx.wxEVT_COMMAND_BUTTON_CLICKED, OnNumber)
