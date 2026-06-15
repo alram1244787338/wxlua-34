@@ -60,38 +60,101 @@ local sample_xpm = {
 }
 
 -- ---------------------------------------------------------------------------
--- return the path part of the currently executing file
-function GetExePath()
-   local function findLast(filePath) -- find index of last / or \ in string
-      local lastOffset = nil
-      local offset = nil
-      repeat
-         offset = string.find(filePath, "\\") or string.find(filePath, "/")
+-- Path utility functions for locating companion script files.
+-- Handles common launch scenarios: from the script directory, from the
+-- project root, from an arbitrary working directory, or via relative path.
 
-         if offset then
-            lastOffset = (lastOffset or 0) + offset
-            filePath = string.sub(filePath, offset + 1)
-         end
-      until not offset
+-- Normalize a file path by resolving "." and ".." components and collapsing
+-- redundant separators.  Does NOT resolve symlinks or query the filesystem.
+local function NormalizePath(p)
+   if not p or p == "" then return "" end
+   p = string.gsub(p, "\\", "/")
+   p = string.gsub(p, "/+", "/")
 
-      return lastOffset
-   end
-
-   local filePath = debug.getinfo(1, "S").source
-
-   if string.byte(filePath) == string.byte('@') then
-      local offset = findLast(filePath)
-      if offset ~= nil then
-         -- remove the @ at the front up to just before the path separator
-         filePath = string.sub(filePath, 2, offset - 1)
-      else
-         filePath = "."
+   local prefix = ""
+   if string.sub(p, 1, 1) == "/" then
+      prefix = "/"
+      p = string.sub(p, 2)
+   elseif string.len(p) >= 2 and string.sub(p, 2, 2) == ":" then
+      prefix = string.sub(p, 1, 2)
+      p = string.sub(p, 3)
+      if string.sub(p, 1, 1) == "/" then
+         prefix = prefix .. "/"
+         p = string.sub(p, 2)
       end
-   else
-      filePath = wx.wxGetCwd()
    end
 
-   return filePath
+   local parts = {}
+   for part in string.gmatch(p, "[^/]+") do
+      if part == "." then
+         -- skip
+      elseif part == ".." then
+         if #parts > 0 and parts[#parts] ~= ".." then
+            table.remove(parts)
+         else
+            table.insert(parts, part)
+         end
+      else
+         table.insert(parts, part)
+      end
+   end
+
+   local result = prefix .. table.concat(parts, "/")
+   if result == "" then return "." end
+   return result
+end
+
+-- Append a directory to the candidates list if not already present
+-- (case-insensitive dedup on Windows, case-sensitive elsewhere).
+local function AddUniqueDir(candidates, seen, dir)
+   if not dir or dir == "" then return end
+   local norm = NormalizePath(dir)
+   if seen[norm] then return end
+   local key = (string.find(wx.wxVERSION_STRING, "Windows") ~= nil)
+               and string.lower(norm) or norm
+   if seen[key] then return end
+   seen[key] = true
+   seen[norm] = true
+   table.insert(candidates, norm)
+end
+
+-- Return the directory of the currently executing Lua script, resolved
+-- against the working directory when the source path is relative.
+local function GetScriptDir()
+   local source = debug.getinfo(1, "S").source
+   if string.byte(source) ~= string.byte('@') then
+      return wx.wxGetCwd()
+   end
+
+   local filePath = string.sub(source, 2) -- strip leading '@'
+   local lastSep = 0
+   while true do
+      local pos = string.find(filePath, "[/\\]", lastSep + 1)
+      if not pos then break end
+      lastSep = pos
+   end
+
+   local dir
+   if lastSep > 0 then
+      dir = string.sub(filePath, 1, lastSep - 1)
+   else
+      dir = "."
+   end
+
+   if dir == "." then
+      return wx.wxGetCwd()
+   elseif string.sub(dir, 1, 1) == "/" or
+          (string.len(dir) >= 2 and string.sub(dir, 2, 2) == ":") then
+      return dir -- already absolute
+   else
+      return wx.wxGetCwd() .. "/" .. dir
+   end
+end
+
+-- Return the directory of the currently executing script (backward-compatible
+-- wrapper kept for any external callers).
+function GetExePath()
+   return GetScriptDir()
 end
 
 -------------------------------------------------------------------------
@@ -2576,7 +2639,38 @@ end
 
 -------------------------------------------------------------------------
 
-local DisplayMinimalFrame = dofile(GetExePath() .. "/propgrid_minimal.wx.lua")
+-- Build an ordered list of candidate directories for propgrid_minimal.wx.lua.
+-- Priority: script directory > cwd > common relative sample locations.
+local _searchDirs = {}
+local _seenDirs = {}
+AddUniqueDir(_searchDirs, _seenDirs, GetScriptDir())
+AddUniqueDir(_searchDirs, _seenDirs, wx.wxGetCwd())
+AddUniqueDir(_searchDirs, _seenDirs, wx.wxGetCwd() .. "/samples")
+AddUniqueDir(_searchDirs, _seenDirs, wx.wxGetCwd() .. "/../samples")
+
+local DisplayMinimalFrame = nil
+for _, _dir in ipairs(_searchDirs) do
+   local _candidate = _dir .. "/propgrid_minimal.wx.lua"
+   local _chunk, _err = loadfile(_candidate)
+   if _chunk then
+      DisplayMinimalFrame = _chunk()
+      break
+   end
+end
+
+if not DisplayMinimalFrame then
+   local _triedList = ""
+   for _, _dir in ipairs(_searchDirs) do
+      _triedList = _triedList .. "\n  " .. _dir .. "/propgrid_minimal.wx.lua"
+   end
+   wx.wxMessageBox(
+      "Could not find 'propgrid_minimal.wx.lua'. The following locations were tried:"
+      .. _triedList,
+      "PropertyGrid Sample - Resource Not Found",
+      wx.wxOK + wx.wxICON_EXCLAMATION,
+      wx.NULL)
+   return
+end
 
 function FormMain:OnRunMinimalClick(_)
    DisplayMinimalFrame(self.this)

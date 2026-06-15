@@ -48,38 +48,104 @@ local xpmdata =
 }
 
 -- ---------------------------------------------------------------------------
--- return the path part of the currently executing file
-function GetExePath()
-    local function findLast(filePath) -- find index of last / or \ in string
-        local lastOffset = nil
-        local offset = nil
-        repeat
-            offset = string.find(filePath, "\\") or string.find(filePath, "/")
+-- Path utility functions for locating resource files.
+-- Handles common launch scenarios: from the script directory, from the
+-- project root, from an arbitrary working directory, or via relative path.
 
-            if offset then
-                lastOffset = (lastOffset or 0) + offset
-                filePath = string.sub(filePath, offset + 1)
-            end
-        until not offset
+-- Normalize a file path by resolving "." and ".." components and collapsing
+-- redundant separators.  Does NOT resolve symlinks or query the filesystem.
+local function NormalizePath(p)
+    if not p or p == "" then return "" end
+    p = string.gsub(p, "\\", "/")
+    p = string.gsub(p, "/+", "/")
 
-        return lastOffset
-    end
-
-    local filePath = debug.getinfo(1, "S").source
-
-    if string.byte(filePath) == string.byte('@') then
-        local offset = findLast(filePath)
-        if offset ~= nil then
-            -- remove the @ at the front up to just before the path separator
-            filePath = string.sub(filePath, 2, offset - 1)
-        else
-            filePath = "."
+    local prefix = ""
+    if string.sub(p, 1, 1) == "/" then
+        prefix = "/"
+        p = string.sub(p, 2)
+    elseif string.len(p) >= 2 and string.sub(p, 2, 2) == ":" then
+        prefix = string.sub(p, 1, 2)
+        p = string.sub(p, 3)
+        if string.sub(p, 1, 1) == "/" then
+            prefix = prefix .. "/"
+            p = string.sub(p, 2)
         end
-    else
-        filePath = wx.wxGetCwd()
     end
 
-    return filePath
+    local parts = {}
+    for part in string.gmatch(p, "[^/]+") do
+        if part == "." then
+            -- skip
+        elseif part == ".." then
+            if #parts > 0 and parts[#parts] ~= ".." then
+                table.remove(parts)
+            else
+                table.insert(parts, part)
+            end
+        else
+            table.insert(parts, part)
+        end
+    end
+
+    local result = prefix .. table.concat(parts, "/")
+    if result == "" then return "." end
+    return result
+end
+
+-- Append a directory to the candidates list if it is not already present
+-- (case-insensitive dedup on Windows, case-sensitive elsewhere).
+local function AddUniqueDir(candidates, seen, dir)
+    if not dir or dir == "" then return end
+    local norm = NormalizePath(dir)
+    if seen[norm] then return end
+    -- also check lowercased key for case-insensitive filesystems
+    local key = (string.find(wx.wxVERSION_STRING, "Windows") ~= nil)
+                and string.lower(norm) or norm
+    if seen[key] then return end
+    seen[key] = true
+    seen[norm] = true
+    table.insert(candidates, norm)
+end
+
+-- Return the directory of the currently executing Lua script, resolved
+-- against the working directory when the source path is relative.
+local function GetScriptDir()
+    local source = debug.getinfo(1, "S").source
+    if string.byte(source) ~= string.byte('@') then
+        return wx.wxGetCwd()
+    end
+
+    local filePath = string.sub(source, 2) -- strip leading '@'
+    local dir = nil
+
+    -- find last path separator
+    local lastSep = 0
+    while true do
+        local pos = string.find(filePath, "[/\\]", lastSep + 1)
+        if not pos then break end
+        lastSep = pos
+    end
+
+    if lastSep > 0 then
+        dir = string.sub(filePath, 1, lastSep - 1)
+    else
+        dir = "."
+    end
+
+    if dir == "." then
+        return wx.wxGetCwd()
+    elseif string.sub(dir, 1, 1) == "/" or
+           (string.len(dir) >= 2 and string.sub(dir, 2, 2) == ":") then
+        return dir -- already absolute
+    else
+        return wx.wxGetCwd() .. "/" .. dir
+    end
+end
+
+-- Return the directory of the currently executing script (backward-compatible
+-- wrapper kept for any external callers).
+function GetExePath()
+    return GetScriptDir()
 end
 
 -- ---------------------------------------------------------------------------
@@ -199,31 +265,72 @@ function main()
     -- xml style resources (if present)
     xmlResource = wx.wxXmlResource()
     xmlResource:InitAllHandlers()
-    local xrcFilename = GetExePath().."/calculator.xrc"
 
-    local logNo = wx.wxLogNull() -- silence wxXmlResource error msg since we provide them
+    -- Build an ordered list of candidate directories for calculator.xrc.
+    -- Priority: script directory > cwd > common relative sample locations.
+    local xrcSearchDirs = {}
+    local seenDirs = {}
+    AddUniqueDir(xrcSearchDirs, seenDirs, GetScriptDir())
+    AddUniqueDir(xrcSearchDirs, seenDirs, wx.wxGetCwd())
+    AddUniqueDir(xrcSearchDirs, seenDirs, wx.wxGetCwd() .. "/samples")
+    AddUniqueDir(xrcSearchDirs, seenDirs, wx.wxGetCwd() .. "/../samples")
 
-    -- try to load the resource and ask for path to it if not found
-    while not xmlResource:Load(xrcFilename) do
-        -- must unload the file before we try again
-        xmlResource:Unload(xrcFilename)
+    -- Try each candidate path with wxXmlResource errors silenced.
+    local xrcFilename = nil
+    local logNo = wx.wxLogNull()
 
-        wx.wxMessageBox("Error loading xrc resources, please choose the path to 'calculator.xrc'.",
-                        "Calculator",
-                        wx.wxOK + wx.wxICON_EXCLAMATION,
-                        wx.NULL)
+    for _, dir in ipairs(xrcSearchDirs) do
+        local candidate = dir .. "/calculator.xrc"
+        if xmlResource:Load(candidate) then
+            xrcFilename = candidate
+            break
+        end
+        xmlResource:Unload(candidate)
+    end
+
+    -- If no candidate worked, report all tried paths and let the user
+    -- pick the file manually.  Retry until a valid file is chosen or the
+    -- dialog is cancelled (clean exit with no half-initialized state).
+    while not xrcFilename do
+        logNo:delete() -- restore wx error output for user-selected files
+
+        local triedList = ""
+        for _, dir in ipairs(xrcSearchDirs) do
+            triedList = triedList .. "\n  " .. dir .. "/calculator.xrc"
+        end
+
+        wx.wxMessageBox(
+            "Could not find 'calculator.xrc'. The following locations were tried:"
+            .. triedList ..
+            "\n\nPlease select the file manually.",
+            "Calculator - Resource Not Found",
+            wx.wxOK + wx.wxICON_EXCLAMATION,
+            wx.NULL)
+
         local fileDialog = wx.wxFileDialog(wx.NULL,
                                            "Open 'calculator.xrc' resource file",
                                            "",
                                            "calculator.xrc",
                                            "XRC files (*.xrc)|*.xrc|All files (*)|*",
-                                            wx.wxFD_OPEN + wx.wxFD_FILE_MUST_EXIST)
+                                           wx.wxFD_OPEN + wx.wxFD_FILE_MUST_EXIST)
 
         if fileDialog:ShowModal() == wx.wxID_OK then
-            xrcFilename = fileDialog:GetPath()
+            local userPath = fileDialog:GetPath()
+            if xmlResource:Load(userPath) then
+                xrcFilename = userPath
+            else
+                -- Wrong file selected; add its directory for context and retry.
+                xmlResource:Unload(userPath)
+                local userDir = userPath:match("^(.*)[/\\]")
+                if userDir then
+                    AddUniqueDir(xrcSearchDirs, seenDirs, userDir)
+                end
+            end
         else
-            return -- quit program
+            return -- user cancelled, quit program cleanly
         end
+
+        logNo = wx.wxLogNull() -- silence again for next round of retries
     end
 
     logNo:delete() -- turn error messages back on
